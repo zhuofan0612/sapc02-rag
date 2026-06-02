@@ -1,24 +1,74 @@
 name: deploy
+
 on:
-  push: { branches: [main] }
+  push:
+    branches: [main]
+
 permissions:
   id-token: write
   contents: read
+
 jobs:
   build-deploy:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::<ACCOUNT_ID>:role/github-oidc-deploy
           aws-region: eu-north-1
+
       - uses: aws-actions/amazon-ecr-login@v2
         id: ecr
+
       - name: Build & push
         run: |
           IMG=${{ steps.ecr.outputs.registry }}/sapc02-rag:latest
           docker build -t $IMG .
           docker push $IMG
+
       - name: Force new deployment
-        run: aws ecs update-service --cluster sapc02-rag --service sapc02-rag --force-new-deployment
+        run: |
+          aws ecs update-service \
+            --cluster sapc02-rag \
+            --service sapc02-rag \
+            --force-new-deployment
+
+      - name: Wait for ECS service to stabilize
+        run: |
+          aws ecs wait services-stable \
+            --cluster sapc02-rag \
+            --services sapc02-rag
+
+      - name: Get ALB DNS
+        id: alb
+        run: |
+          DNS=$(aws elbv2 describe-load-balancers \
+            --names sapc02-rag \
+            --query 'LoadBalancers[0].DNSName' \
+            --output text)
+          echo "dns=$DNS" >> $GITHUB_OUTPUT
+
+      - name: Verify health endpoint
+        run: |
+          echo "Hitting http://${{ steps.alb.outputs.dns }}/health"
+          for i in {1..10}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://${{ steps.alb.outputs.dns }}/health)
+            if [ "$STATUS" = "200" ]; then
+              echo "Health check passed"
+              exit 0
+            fi
+            echo "Attempt $i: got $STATUS, retrying..."
+            sleep 15
+          done
+          echo "Health check failed after 10 attempts"
+          exit 1
+
+      - name: Smoke test /ask endpoint
+        run: |
+          RESPONSE=$(curl -s -X POST http://${{ steps.alb.outputs.dns }}/ask \
+            -H "Content-Type: application/json" \
+            -d '{"question":"What is the difference between SCP and IAM policy?"}')
+          echo "Response: $RESPONSE"
+          echo $RESPONSE | python3 -c "import sys,json; d=json.load(sys.stdin); exit(0 if 'answer' in d else 1)"

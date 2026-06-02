@@ -1,22 +1,34 @@
 from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from dotenv import load_dotenv
-from app.rag import ingest, answer
+from app.rag import ingest, answer, answer_stream
 
-load_dotenv()  # loads .env locally; on ECS the env var comes from Secrets Manager
 app = FastAPI()
+
 
 class Q(BaseModel):
     question: str
+    session_id: str | None = None  # pass same ID across turns to keep conversation history
+
 
 @app.on_event("startup")
 def _startup():
     ingest()
 
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
+
 @app.post("/ask")
 def ask(q: Q):
-    return {"answer": answer(q.question)}
+    return {"answer": answer(q.question, q.session_id)}
+
+
+@app.post("/ask/stream")
+def ask_stream(q: Q):
+    return StreamingResponse(
+        answer_stream(q.question, q.session_id),
+        media_type="text/event-stream",
+    )

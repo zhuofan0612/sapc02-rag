@@ -1,0 +1,41 @@
+name: infra
+
+on:
+  push:
+    branches: [infra]
+  pull_request:
+    branches: [infra]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::<ACCOUNT_ID>:role/github-oidc-deploy
+          aws-region: eu-north-1
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        run: terraform plan -var="anthropic_key=${{ secrets.ANTHROPIC_API_KEY }}"
+
+      - name: Terraform Apply
+        if: github.event_name == 'push' && github.ref == 'refs/heads/infra'
+        run: terraform apply -auto-approve -var="anthropic_key=${{ secrets.ANTHROPIC_API_KEY }}"
