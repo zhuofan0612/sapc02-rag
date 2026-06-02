@@ -13,10 +13,13 @@ resource "random_id" "s" { byte_length = 4 }
 resource "aws_s3_bucket" "docs" { bucket = "${var.project}-docs-${random_id.s.hex}" }
 
 # --- Secrets Manager ---
-resource "aws_secretsmanager_secret" "anthropic" { name = "${var.project}-anthropic-key" }
-resource "aws_secretsmanager_secret_version" "anthropic" {
-  secret_id     = aws_secretsmanager_secret.anthropic.id
-  secret_string = var.anthropic_key
+# Secret is bootstrapped manually once via AWS CLI:
+#   aws secretsmanager put-secret-value \
+#     --secret-id sapc02-rag-anthropic-key \
+#     --secret-string "sk-ant-xxxx"
+# Terraform only reads the ARN — never manages the value.
+data "aws_secretsmanager_secret" "anthropic" {
+  name = "${var.project}-anthropic-key"
 }
 
 # --- ECS Cluster ---
@@ -118,7 +121,7 @@ resource "aws_ecs_task_definition" "app" {
     }]
     secrets = [{
       name      = "ANTHROPIC_API_KEY"
-      valueFrom = aws_secretsmanager_secret.anthropic.arn
+      valueFrom = data.aws_secretsmanager_secret.anthropic.arn
     }]
     logConfiguration = {
       logDriver = "awslogs"
