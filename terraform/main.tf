@@ -1,39 +1,190 @@
 provider "aws" { region = var.region }
 
-data "aws_vpc" "default" { default = true }
-data "aws_subnets" "default" {
-  filter { name = "vpc-id" values = [data.aws_vpc.default.id] }
+data "aws_availability_zones" "available" { state = "available" }
+
+# =============================================================================
+# VPC
+# =============================================================================
+
+resource "aws_vpc" "main" {
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_support   = true
+  enable_dns_hostnames = true
 }
 
-# --- ECR ---
-resource "aws_ecr_repository" "app" { name = var.project }
-
-# --- S3 (docs storage) ---
-resource "random_id" "s" { byte_length = 4 }
-resource "aws_s3_bucket" "docs" { bucket = "${var.project}-docs-${random_id.s.hex}" }
-
-# --- Secrets Manager ---
-# Secret is bootstrapped manually once via AWS CLI:
-#   aws secretsmanager put-secret-value \
-#     --secret-id sapc02-rag-anthropic-key \
-#     --secret-string "sk-ant-xxxx"
-# Terraform only reads the ARN — never manages the value.
-data "aws_secretsmanager_secret" "anthropic" {
-  name = "${var.project}-anthropic-key"
+# --- Public subnets (ALB + NAT Gateway) ---
+resource "aws_subnet" "public" {
+  count                   = 2
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = "10.0.${count.index}.0/24"
+  availability_zone       = data.aws_availability_zones.available.names[count.index]
+  map_public_ip_on_launch = true
 }
 
-# --- ECS Cluster ---
-resource "aws_ecs_cluster" "main" { name = var.project }
-
-resource "aws_cloudwatch_log_group" "app" {
-  name              = "/ecs/${var.project}"
-  retention_in_days = 7
+# --- Private subnets (ECS Fargate) ---
+resource "aws_subnet" "private" {
+  count             = 2
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = "10.0.${count.index + 10}.0/24"
+  availability_zone = data.aws_availability_zones.available.names[count.index]
 }
 
-# --- Security Groups ---
+# --- Internet Gateway (public subnet → internet) ---
+resource "aws_internet_gateway" "main" {
+  vpc_id = aws_vpc.main.id
+}
+
+# --- Elastic IP + NAT Gateway (private subnet → internet, outbound only) ---
+resource "aws_eip" "nat" { domain = "vpc" }
+
+resource "aws_nat_gateway" "main" {
+  allocation_id = aws_eip.nat.id
+  subnet_id     = aws_subnet.public[0].id
+  depends_on    = [aws_internet_gateway.main]
+}
+
+# --- Route tables ---
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.main.id
+  }
+}
+
+resource "aws_route_table" "private" {
+  vpc_id = aws_vpc.main.id
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.main.id
+  }
+}
+
+resource "aws_route_table_association" "public" {
+  count          = 2
+  subnet_id      = aws_subnet.public[count.index].id
+  route_table_id = aws_route_table.public.id
+}
+
+resource "aws_route_table_association" "private" {
+  count          = 2
+  subnet_id      = aws_subnet.private[count.index].id
+  route_table_id = aws_route_table.private.id
+}
+
+# =============================================================================
+# NACLs
+# =============================================================================
+
+# --- Public NACL (ALB + NAT Gateway subnet) ---
+resource "aws_network_acl" "public" {
+  vpc_id     = aws_vpc.main.id
+  subnet_ids = aws_subnet.public[*].id
+
+  # Inbound: HTTP from internet to ALB
+  ingress {
+    rule_no    = 100
+    protocol   = "tcp"
+    action     = "allow"
+    cidr_block = "0.0.0.0/0"
+    from_port  = 80
+    to_port    = 80
+  }
+
+  # Inbound: return traffic from internet (responses to NAT outbound calls)
+  ingress {
+    rule_no    = 200
+    protocol   = "tcp"
+    action     = "allow"
+    cidr_block = "0.0.0.0/0"
+    from_port  = 1024
+    to_port    = 65535
+  }
+
+  # Outbound: forward to ECS in private subnet
+  egress {
+    rule_no    = 100
+    protocol   = "tcp"
+    action     = "allow"
+    cidr_block = "10.0.0.0/16"
+    from_port  = 8000
+    to_port    = 8000
+  }
+
+  # Outbound: NAT outbound to internet (Claude API, ECR, S3 — all HTTPS)
+  egress {
+    rule_no    = 200
+    protocol   = "tcp"
+    action     = "allow"
+    cidr_block = "0.0.0.0/0"
+    from_port  = 443
+    to_port    = 443
+  }
+
+  # Outbound: return traffic to internet (ALB responses to clients)
+  egress {
+    rule_no    = 300
+    protocol   = "tcp"
+    action     = "allow"
+    cidr_block = "0.0.0.0/0"
+    from_port  = 1024
+    to_port    = 65535
+  }
+}
+
+# --- Private NACL (ECS subnet) ---
+resource "aws_network_acl" "private" {
+  vpc_id     = aws_vpc.main.id
+  subnet_ids = aws_subnet.private[*].id
+
+  # Inbound: traffic from ALB (via VPC)
+  ingress {
+    rule_no    = 100
+    protocol   = "tcp"
+    action     = "allow"
+    cidr_block = "10.0.0.0/16"
+    from_port  = 8000
+    to_port    = 8000
+  }
+
+  # Inbound: return traffic from NAT (responses from Claude API, ECR, S3)
+  ingress {
+    rule_no    = 200
+    protocol   = "tcp"
+    action     = "allow"
+    cidr_block = "0.0.0.0/0"
+    from_port  = 1024
+    to_port    = 65535
+  }
+
+  # Outbound: HTTPS to internet via NAT (Claude API, ECR, S3)
+  egress {
+    rule_no    = 100
+    protocol   = "tcp"
+    action     = "allow"
+    cidr_block = "0.0.0.0/0"
+    from_port  = 443
+    to_port    = 443
+  }
+
+  # Outbound: return traffic back to ALB
+  egress {
+    rule_no    = 200
+    protocol   = "tcp"
+    action     = "allow"
+    cidr_block = "10.0.0.0/16"
+    from_port  = 1024
+    to_port    = 65535
+  }
+}
+
+# =============================================================================
+# Security Groups
+# =============================================================================
+
 resource "aws_security_group" "alb" {
   name   = "${var.project}-alb"
-  vpc_id = data.aws_vpc.default.id
+  vpc_id = aws_vpc.main.id
 
   ingress {
     from_port   = 80
@@ -51,58 +202,61 @@ resource "aws_security_group" "alb" {
 
 resource "aws_security_group" "app" {
   name   = "${var.project}-app"
-  vpc_id = data.aws_vpc.default.id
+  vpc_id = aws_vpc.main.id
 
+  # Only accepts traffic from ALB security group
   ingress {
     from_port       = 8000
     to_port         = 8000
     protocol        = "tcp"
     security_groups = [aws_security_group.alb.id]
   }
+  # Outbound: Claude API, ECR, S3, Secrets Manager (all HTTPS)
   egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
 }
 
-# --- ALB ---
-resource "aws_lb" "app" {
-  name               = var.project
-  internal           = false
-  load_balancer_type = "application"
-  security_groups    = [aws_security_group.alb.id]
-  subnets            = data.aws_subnets.default.ids
+# =============================================================================
+# ECR
+# =============================================================================
+
+resource "aws_ecr_repository" "app" { name = var.project }
+
+# =============================================================================
+# S3 (docs storage)
+# =============================================================================
+
+resource "random_id" "s" { byte_length = 4 }
+resource "aws_s3_bucket" "docs" { bucket = "${var.project}-docs-${random_id.s.hex}" }
+
+# =============================================================================
+# Secrets Manager
+# =============================================================================
+
+# Secret is bootstrapped manually once via AWS CLI:
+#   aws secretsmanager put-secret-value \
+#     --secret-id sapc02-rag-anthropic-key \
+#     --secret-string "sk-ant-xxxx"
+# Terraform only reads the ARN — never manages the value.
+data "aws_secretsmanager_secret" "anthropic" {
+  name = "${var.project}-anthropic-key"
 }
 
-resource "aws_lb_target_group" "app" {
-  name        = var.project
-  port        = 8000
-  protocol    = "HTTP"
-  vpc_id      = data.aws_vpc.default.id
-  target_type = "ip"
+# =============================================================================
+# ECS
+# =============================================================================
 
-  health_check {
-    path                = "/health"
-    interval            = 30
-    healthy_threshold   = 2
-    unhealthy_threshold = 3
-  }
+resource "aws_ecs_cluster" "main" { name = var.project }
+
+resource "aws_cloudwatch_log_group" "app" {
+  name              = "/ecs/${var.project}"
+  retention_in_days = 7
 }
 
-resource "aws_lb_listener" "http" {
-  load_balancer_arn = aws_lb.app.arn
-  port              = 80
-  protocol          = "HTTP"
-
-  default_action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.app.arn
-  }
-}
-
-# --- ECS Task Definition ---
 resource "aws_ecs_task_definition" "app" {
   family                   = var.project
   requires_compatibilities = ["FARGATE"]
@@ -134,7 +288,6 @@ resource "aws_ecs_task_definition" "app" {
   }])
 }
 
-# --- ECS Service ---
 resource "aws_ecs_service" "app" {
   name            = var.project
   cluster         = aws_ecs_cluster.main.id
@@ -143,9 +296,9 @@ resource "aws_ecs_service" "app" {
   launch_type     = "FARGATE"
 
   network_configuration {
-    subnets          = data.aws_subnets.default.ids
+    subnets          = aws_subnet.private[*].id   # private subnets
     security_groups  = [aws_security_group.app.id]
-    assign_public_ip = true
+    assign_public_ip = false                       # no public IP
   }
 
   load_balancer {
@@ -157,7 +310,47 @@ resource "aws_ecs_service" "app" {
   depends_on = [aws_lb_listener.http]
 }
 
-# --- Auto Scaling ---
+# =============================================================================
+# ALB
+# =============================================================================
+
+resource "aws_lb" "app" {
+  name               = var.project
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.alb.id]
+  subnets            = aws_subnet.public[*].id     # public subnets
+}
+
+resource "aws_lb_target_group" "app" {
+  name        = var.project
+  port        = 8000
+  protocol    = "HTTP"
+  vpc_id      = aws_vpc.main.id
+  target_type = "ip"
+
+  health_check {
+    path                = "/health"
+    interval            = 30
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
+  }
+}
+
+resource "aws_lb_listener" "http" {
+  load_balancer_arn = aws_lb.app.arn
+  port              = 80
+  protocol          = "HTTP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.app.arn
+  }
+}
+
+# =============================================================================
+# Auto Scaling
+# =============================================================================
 
 resource "aws_appautoscaling_target" "ecs" {
   max_capacity       = 4

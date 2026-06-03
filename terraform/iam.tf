@@ -24,7 +24,7 @@ resource "aws_iam_role_policy" "exec_secret" {
     Statement = [{
       Effect   = "Allow"
       Action   = ["secretsmanager:GetSecretValue"]
-      Resource = aws_secretsmanager_secret.anthropic.arn
+      Resource = data.aws_secretsmanager_secret.anthropic.arn
     }]
   })
 }
