@@ -9,37 +9,15 @@ from app.initial import client, MODEL, MAX_TOKENS
 _embed = SentenceTransformer("all-MiniLM-L6-v2")
 _reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
-# --- Multi-collection ChromaDB ---
+# --- Single collection with source metadata ---
 _chroma = chromadb.Client()
-TOPICS = ["networking", "storage", "compute", "databases", "security", "migration", "general"]
-_collections = {t: _chroma.get_or_create_collection(f"sapc02_{t}") for t in TOPICS}
-
-TOPIC_KEYWORDS = {
-    "networking": ["vpc", "subnet", "route53", "cloudfront", "direct connect", "transit gateway",
-                   "nat", "igw", "alb", "nlb", "security group", "peering", "global accelerator"],
-    "storage":    ["s3", "ebs", "efs", "fsx", "glacier", "storage gateway", "snowball", "datasync"],
-    "compute":    ["ec2", "lambda", "ecs", "fargate", "auto scaling", "elastic beanstalk", "batch"],
-    "databases":  ["rds", "dynamodb", "aurora", "elasticache", "redshift", "neptune", "dax"],
-    "security":   ["iam", "kms", "secrets manager", "guardduty", "waf", "shield", "macie",
-                   "inspector", "scp", "organization"],
-    "migration":  ["dms", "datasync", "snowball", "migration hub", "server migration", "sct"],
-}
+_collection = _chroma.get_or_create_collection("sapc02")
 
 # --- In-memory session store: session_id -> message history ---
 _sessions: dict[str, list] = {}
 
 
 # --- Helpers ---
-
-def classify_topic(text: str) -> str:
-    text_lower = text.lower()
-    scores = {
-        topic: sum(1 for kw in keywords if kw in text_lower)
-        for topic, keywords in TOPIC_KEYWORDS.items()
-    }
-    best = max(scores, key=scores.get)
-    return best if scores[best] > 0 else "general"
-
 
 def chunk(text: str, size: int = 800, overlap: int = 100) -> list[str]:
     out, i = [], 0
@@ -87,41 +65,34 @@ def sync_from_s3(local_folder: str = "app/docs"):
 def ingest(folder: str = "app/docs") -> int:
     sync_from_s3(folder)
 
-    docs_by_topic: dict[str, list[tuple[str, str]]] = {t: [] for t in TOPICS}
+    docs, ids, metadatas = [], [], []
     idx = 0
 
     for path in glob.glob(f"{folder}/*"):
+        source = os.path.basename(path)
         text = read_file(path)
         for c in chunk(text):
             if not is_meaningful(c):
                 continue
-            topic = classify_topic(c)
-            docs_by_topic[topic].append((c, f"d{idx}"))
+            docs.append(c)
+            ids.append(f"d{idx}")
+            metadatas.append({"source": source})
             idx += 1
 
-    for topic, pairs in docs_by_topic.items():
-        if not pairs:
-            continue
-        texts, ids = zip(*pairs)
-        embeds = _embed.encode(list(texts)).tolist()
-        _collections[topic].add(documents=list(texts), embeddings=embeds, ids=list(ids))
+    if docs:
+        embeds = _embed.encode(docs).tolist()
+        _collection.add(documents=docs, embeddings=embeds, ids=ids, metadatas=metadatas)
 
     return idx
 
 
 # --- Retrieval with re-ranking ---
 
-def _retrieve_context(question: str, k: int = 4) -> str:
+def _retrieve_context(question: str, k: int = 10) -> str:
     q_embed = _embed.encode([question]).tolist()
 
-    # Search all collections — re-ranker picks the best chunks across all topics
-    all_chunks = []
-    for col in _collections.values():
-        if col.count() == 0:
-            continue
-        hits = col.query(query_embeddings=q_embed, n_results=k)
-        if hits["documents"]:
-            all_chunks.extend(hits["documents"][0])
+    hits = _collection.query(query_embeddings=q_embed, n_results=k)
+    all_chunks = hits["documents"][0] if hits["documents"] else []
 
     # Re-rank with cross-encoder, keep top 4
     if all_chunks:
@@ -140,8 +111,8 @@ def _get_history(session_id: str | None) -> list:
 
 # --- Answer (blocking) ---
 
-def answer(question: str, session_id: str | None = None, k: int = 6) -> str:
-    context = _retrieve_context(question, k)
+def answer(question: str, session_id: str | None = None) -> str:
+    context = _retrieve_context(question)
     history = _get_history(session_id)
     history.append({"role": "user", "content": question})
 
@@ -166,8 +137,8 @@ def answer(question: str, session_id: str | None = None, k: int = 6) -> str:
 
 # --- Answer (streaming) ---
 
-def answer_stream(question: str, session_id: str | None = None, k: int = 6):
-    context = _retrieve_context(question, k)
+def answer_stream(question: str, session_id: str | None = None):
+    context = _retrieve_context(question)
     history = _get_history(session_id)
     history.append({"role": "user", "content": question})
 
