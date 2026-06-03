@@ -49,6 +49,15 @@ def chunk(text: str, size: int = 800, overlap: int = 100) -> list[str]:
     return out
 
 
+def is_meaningful(text: str) -> bool:
+    """Filter out chunks that are mostly whitespace or PDF formatting garbage."""
+    stripped = text.strip()
+    if len(stripped) < 100:
+        return False
+    alnum = sum(1 for c in stripped if c.isalnum() or c == ' ')
+    return alnum / len(stripped) > 0.5
+
+
 def read_file(path: str) -> str:
     if path.endswith(".pdf"):
         reader = PdfReader(path)
@@ -84,6 +93,8 @@ def ingest(folder: str = "app/docs") -> int:
     for path in glob.glob(f"{folder}/*"):
         text = read_file(path)
         for c in chunk(text):
+            if not is_meaningful(c):
+                continue
             topic = classify_topic(c)
             docs_by_topic[topic].append((c, f"d{idx}"))
             idx += 1
@@ -100,17 +111,14 @@ def ingest(folder: str = "app/docs") -> int:
 
 # --- Retrieval with re-ranking ---
 
-def _retrieve_context(question: str, k: int = 6) -> str:
-    topic = classify_topic(question)
+def _retrieve_context(question: str, k: int = 4) -> str:
     q_embed = _embed.encode([question]).tolist()
 
-    # Search topic collection + general as fallback
-    cols = [_collections[topic]]
-    if topic != "general":
-        cols.append(_collections["general"])
-
+    # Search all collections — re-ranker picks the best chunks across all topics
     all_chunks = []
-    for col in cols:
+    for col in _collections.values():
+        if col.count() == 0:
+            continue
         hits = col.query(query_embeddings=q_embed, n_results=k)
         if hits["documents"]:
             all_chunks.extend(hits["documents"][0])
